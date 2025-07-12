@@ -1,5 +1,7 @@
 "use client";
 
+import levenshtein from "fast-levenshtein";
+
 interface SpotifyTrack {
   id: string;
   name: string;
@@ -41,21 +43,65 @@ class SpotifyAPI {
     return response.json();
   }
 
+  private norm = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-zа-яё0-9]/gi, "")
+      .trim();
+
+  private lev(a: string, b: string) {
+    return levenshtein.get(this.norm(a), this.norm(b));
+  }
+
+  private getFullArtistTrack(q: string) {
+    const parts = q.split(/\s+-\s+/);
+    if (parts.length >= 2) {
+      return {
+        artist: parts[0].trim(),
+        track: parts.slice(1).join(" - ").trim(),
+      };
+    }
+    return { artist: "", track: q };
+  }
+
+  private pickBestTrack(
+    items: any[],
+    artist: string,
+    track: string
+  ): SpotifyTrack | null {
+    if (!items.length) return null;
+
+    const scored = items.map((t: any) => {
+      const cleanTitle = (s: string) =>
+        s
+          .replace(/\([^)]*\)/g, "")
+          .replace(/\b(feat|ft|version|edit|remix|piano)\b.*$/i, "")
+          .trim();
+
+      const distArtist = artist
+        ? this.lev(artist, cleanTitle(t.artists[0].name))
+        : 99;
+      const distTitle = track ? this.lev(track, cleanTitle(t.name)) : 99;
+
+      const bonus =
+        this.norm(t.artists[0].name) === this.norm(artist)
+          ? -1
+          : 0 + this.norm(t.name) === this.norm(track)
+          ? -1
+          : 0;
+      return { t, score: distArtist + distTitle + bonus };
+    });
+
+    scored.sort((a, b) => a.score - b.score);
+    const best = scored[0];
+
+    return { ...best.t, isExact: best.score <= 4 };
+  }
+
   async searchTrack(
     query: string,
     findSimilar = true
   ): Promise<SpotifyTrack | null> {
-    const getFullArtistTrack = (q: string) => {
-      const parts = q.split(/\s+-\s+/);
-      if (parts.length >= 2) {
-        return {
-          artist: parts[0].trim(),
-          track: parts.slice(1).join(" - ").trim(),
-        };
-      }
-      return { artist: "", track: q };
-    };
-
     try {
       const normalizeDash = (s: string) => s.replace(/[—–‒\\-]/g, "-");
 
@@ -67,7 +113,7 @@ class SpotifyAPI {
 
       console.log("cleanQuery", cleanQuery);
 
-      const { artist, track } = getFullArtistTrack(cleanQuery);
+      const { artist, track } = this.getFullArtistTrack(cleanQuery);
 
       console.log("parsed artist", artist);
       console.log("parsed track", track);
@@ -83,15 +129,19 @@ class SpotifyAPI {
         const exactData = await this.makeRequest(
           `/search?q=${encodeURIComponent(
             exactQuery
-          )}&type=track&limit=1&market=from_token`
+          )}&type=track&limit=10&market=from_token`
         );
 
-        console.log("exactData", exactData);
-        console.log("exactData tracks", exactData.tracks);
-        console.log("exactData tracks items", exactData.tracks.items);
+        const foundTrack = this.pickBestTrack(
+          exactData.tracks.items,
+          artist,
+          track
+        );
 
-        if (exactData.tracks.items.length > 0) {
-          return { ...exactData.tracks.items[0], isExact: true };
+        console.log("foundTrack", foundTrack);
+
+        if (foundTrack?.isExact) {
+          return foundTrack;
         }
       }
 
@@ -99,29 +149,33 @@ class SpotifyAPI {
       const fullQueryData = await this.makeRequest(
         `/search?q=${encodeURIComponent(
           cleanQuery
-        )}&type=track&limit=1&market=from_token`
+        )}&type=track&limit=10&market=from_token`
       );
 
       if (fullQueryData.tracks.items.length > 0) {
         console.log("2. Full query search");
-        console.log("2. fullQueryData", fullQueryData);
-        console.log("2. fullQueryData tracks", fullQueryData.tracks);
+
         console.log(
           "2. fullQueryData tracks items",
           fullQueryData.tracks.items
         );
 
-        const foundTrack = fullQueryData.tracks.items[0];
+        const foundTrack = this.pickBestTrack(
+          fullQueryData.tracks.items,
+          artist,
+          track
+        );
 
-        // Check if it's a close match
-        if (this.isCloseMatch(cleanQuery, foundTrack, artist, track)) {
-          console.log("2. close match");
-          return { ...foundTrack, isExact: true };
-        }
+        console.log("foundTrack", foundTrack);
 
-        if (findSimilar) {
+        if (findSimilar && foundTrack) {
           console.log("2. find similar");
           return { ...foundTrack, isExact: false };
+        }
+
+        if (foundTrack) {
+          console.log("2. exact match");
+          return { ...foundTrack, isExact: true };
         }
       }
 
@@ -132,7 +186,9 @@ class SpotifyAPI {
         if (track) {
           console.log("3. track");
           const trackOnlyData = await this.makeRequest(
-            `/search?q=${encodeURIComponent(track)}&type=track&limit=5`
+            `/search?q=${encodeURIComponent(
+              track
+            )}&type=track&limit=10&market=from_token`
           );
 
           if (trackOnlyData.tracks.items.length > 0) {
@@ -146,7 +202,7 @@ class SpotifyAPI {
         if (artist) {
           console.log("3. artist");
           const artistOnlyData = await this.makeRequest(
-            `/search?q=artist:"${artist}"&type=track&limit=5`
+            `/search?q=artist:"${artist}"&type=track&limit=10&market=from_token`
           );
 
           if (artistOnlyData.tracks.items.length > 0) {
@@ -163,54 +219,7 @@ class SpotifyAPI {
     }
   }
 
-  private isCloseMatch(
-    originalQuery: string,
-    foundTrack: SpotifyTrack,
-    artist: string,
-    track: string
-  ): boolean {
-    const foundArtist = foundTrack.artists[0]?.name.toLowerCase() || "";
-    const foundTitle = foundTrack.name.toLowerCase();
-
-    if (artist && track) {
-      console.log("- Close match. artist and track");
-      const artistMatch =
-        foundArtist.includes(artist.toLowerCase()) ||
-        artist.toLowerCase().includes(foundArtist);
-      console.log("- Close match. artistMatch", artistMatch);
-      const trackMatch =
-        foundTitle.includes(track.toLowerCase()) ||
-        track.toLowerCase().includes(foundTitle);
-      console.log("- Close match. trackMatch", trackMatch);
-
-      return artistMatch && trackMatch;
-    }
-
-    const queryWords = originalQuery
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((word) => word.length > 2);
-    const foundWords = (foundArtist + " " + foundTitle).split(/\s+/);
-
-    const matchingWords = queryWords.filter((word) =>
-      foundWords.some(
-        (foundWord) => foundWord.includes(word) || word.includes(foundWord)
-      )
-    );
-    console.log("- Close match. matchingWords", matchingWords);
-    console.log(
-      "- Close match. Math.min(2, queryWords.length)",
-      Math.min(2, queryWords.length)
-    );
-    console.log(
-      "- Close match. matchingWords.length >= Math.min(2, queryWords.length)",
-      matchingWords.length >= Math.min(2, queryWords.length)
-    );
-    return matchingWords.length >= Math.min(2, queryWords.length);
-  }
-
   async createPlaylist(name: string): Promise<SpotifyPlaylist> {
-    // Get current user ID
     const user = await this.makeRequest("/me");
 
     const data = await this.makeRequest(`/users/${user.id}/playlists`, {
